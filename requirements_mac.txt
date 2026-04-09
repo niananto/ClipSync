@@ -1,0 +1,6 @@
+pillow==12.1.1
+pyobjc-core==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-Quartz==12.1
+pystray==0.19.5
+six==1.17.0
