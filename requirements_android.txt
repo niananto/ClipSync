@@ -1,0 +1,7 @@
+# No pip dependencies — server and client both use stdlib only.
+# Required Termux packages (install with `pkg install`):
+#   python
+#   termux-api          (host-side Termux:API CLI tools)
+# Required apps (install from F-Droid):
+#   Termux:Boot
+#   Termux:API

@@ -1,169 +1,141 @@
 # ClipSync
 
-A lightweight, open clipboard sync between your Windows PC, Mac, and iPhone — no cloud account required, no third-party service, just a direct LAN connection.
+LAN / Tailscale clipboard sync between Windows, Mac, Android (and iPhone via Mac+Handoff). No cloud account, no third-party service, direct TCP. Python only.
 
 ```
-Windows ──── <ClipSync> ──── Mac ──── <Handoff> ──── iPhone
+Windows ─┐
+         │
+Mac ─────┼──> Android (relay) <── other Android client
+         │
+iPhone ──┘  (bridged via Mac + Apple Universal Clipboard)
 ```
 
-The Mac acts as the hub. Windows syncs to the Mac over your local network, and the Mac's built-in Universal Clipboard (Handoff) takes care of the iPhone side automatically.
+## Three versions in this repo
 
----
+| Version | Location           | Topology                                    | Scope                              |
+|---------|--------------------|---------------------------------------------|------------------------------------|
+| V1      | [`v1/`](v1/)       | Mac server ↔ Windows client                 | Text only. Stdlib only.            |
+| V2      | [`v2/`](v2/)       | Mac server ↔ Windows client                 | Text, images, files, tray, auto-start. LAN only. |
+| V3      | (this root folder) | Android relay ← Mac/Win/Android clients     | Multi-client fan-out. Tailscale or LAN. |
 
-## Features
+V1 and V2 are frozen, kept for reference and as known-good fallbacks. V3 is the active version.
 
-- **Text** — syncs instantly in both directions
-- **Images** — clipboard images (screenshots, browser copies) sync directly; large images are saved to the ClipSync folder automatically
-- **Files** — copy a file in Finder or Explorer and paste it on the other machine natively (Cmd+V / Ctrl+V works)
-- **Tray icon** — Mac menu bar icon and Windows system tray icon with Pause / Resume / Quit
-- **Auto-start** — starts silently at login on both platforms, no terminal window
-- **Notifications** — toast notifications on both platforms when a file or large image arrives
-- **Conflict resolution** — received files are saved as `photo.png`, `photo (2).png` etc. if a name clash exists
+## V3 in 60 seconds
 
-### Content size rules
+- **Android phone** runs a relay server (in Termux+proot Debian, alongside Tailscale/Jellyfin). Pure fan-out; never touches its own clipboard from the server.
+- **Mac, Windows, and (separately) native Termux on Android** run clients. Each polls its local clipboard every 500ms and pushes changes to the relay; relay broadcasts to every other connected client.
+- **iPhone** bridges through the Mac via Apple's Universal Clipboard (Handoff) — same trick as V2. No native iOS app.
+- **Transport**: plain TCP port 9999. Encryption + access control come from Tailscale (Wireguard + ACLs). Works on LAN too, just without those guarantees.
 
-| Type | Behaviour |
-|---|---|
-| Text | Always synced |
-| Image < 10 MB | Synced directly to clipboard — paste anywhere |
-| Image 10–50 MB | Saved to ClipSync folder + notification |
-| Image > 50 MB | Skipped with a warning |
-| File < 50 MB | Transferred, saved to ClipSync folder, native paste works |
-| File > 50 MB | Skipped with a warning |
+## V3 quick start
 
----
+See [SETUP.md](SETUP.md) for the full walkthrough. Short version:
 
-## File layout
+**Android (server + client, one device):** see [android/README.md](android/README.md).
 
-Each machine only needs its own two files — they must be in the same folder.
-
-```
-Mac
-├── clipboard_server_v2.py
-└── clipsync_tray_mac.py
-
-Windows
-├── clipboard_client_v2.py
-└── clipsync_tray_win.py
-```
-
-The `ClipSync/` folder inside your Downloads is created automatically on both sides and is where received files and large images land.
-
----
-
-## Quick start
-
-### Mac
-
+**Mac (client):**
 ```bash
-pip3 install pystray Pillow pyobjc-framework-Cocoa
-python3 clipsync_tray_mac.py
+pip3 install -r requirements_mac.txt
+python3 clipsync_tray_mac.py --host phone.tail-xxxx.ts.net          # first run
+python3 clipsync_tray_mac.py --host phone.tail-xxxx.ts.net --install # auto-start
 ```
 
-A clipboard icon appears in your **menu bar**. Click it to Pause / Resume / Quit.
-
-### Windows
-
+**Windows (client, NOT as admin):**
 ```powershell
-pip install pystray Pillow pyperclip pywin32
-python clipsync_tray_win.py --host 192.168.10.145
+pip install -r requirements_win.txt
+python clipsync_tray_win.py --host phone.tail-xxxx.ts.net
+python clipsync_tray_win.py --host phone.tail-xxxx.ts.net --install
 ```
 
-A clipboard icon appears in your **system tray** (bottom-right — check the ^ overflow if you don't see it immediately). Right-click for the menu.
+`--host` accepts: Tailscale MagicDNS name, Tailscale IPv4, LAN IP, or any hostname `socket.getaddrinfo` can resolve.
 
-> The Mac IP is saved after the first run so you won't need `--host` again.
+## V3 collision with V2
 
-For full setup instructions including auto-start on login, see [SETUP.md](SETUP.md).
+V3 install scripts **refuse** to run on top of a V2 install. They detect:
+- Mac: `~/Library/LaunchAgents/com.clipsync.server.plist` or a loaded `com.clipsync.server` agent
+- Windows: scheduled task named `ClipSync`
 
----
+If detected, the installer prints the exact commands to uninstall V2 and exits. V3 uses new names (`com.clipsync.v3.client` / `ClipSyncV3`) so the two never share an identifier.
 
-## Tray menu
+If you want to keep V2 running on a side machine while V3 runs on others, that's fine — only the same machine can't host both at once (they'd race on the clipboard).
 
-| Item | Behaviour |
-|---|---|
-| ClipSync — ● Active | Status indicator |
-| ClipSync — ⏸ Paused | Status when paused |
-| Pause Sync | Suspends sync; connection stays alive for instant resume |
-| Resume Sync | Resumes sync |
-| Open ClipSync Folder | Opens `~/Downloads/ClipSync` in Finder / Explorer |
-| Quit | Stops ClipSync entirely |
+## V3 file layout
 
----
-
-## Roadmap
-
-| Version | Status | What it covers |
-|---|---|---|
-| V1 | ✅ Done | Text only, LAN |
-| V2 | ✅ Done | Images, files, tray icon, auto-start |
-| V3 | 🔜 Planned | Tailscale (works outside your home network), TLS encryption, shared-secret authentication |
-
-V3 will require almost no structural change — the codebase is already wired with `V3 TODO` markers at every extension point. The sync logic stays the same; only the transport layer changes.
-
----
+```
+clipsync_server.py            # relay (run on Android in proot Debian; stdlib only)
+clipsync_client.py            # client core: transport, framing, watcher loop
+clipboard_mac.py              # platform clipboard: NSPasteboard
+clipboard_win.py              # platform clipboard: win32clipboard + CF_HDROP
+clipboard_android.py          # platform clipboard: termux-clipboard-get/set
+clipsync_tray_mac.py          # menu-bar wrapper; --install / --uninstall
+clipsync_tray_win.py          # system-tray wrapper; --install / --uninstall
+clipsync_debug.py             # cross-platform diagnostic
+android/
+  boot-server.sh              # ~/.termux/boot/ launcher for the relay
+  boot-client.sh              # ~/.termux/boot/ launcher for the client
+  README.md                   # Android-specific setup
+requirements_mac.txt
+requirements_win.txt
+requirements_android.txt
+v1/                           # frozen V1
+v2/                           # frozen V2 (still works standalone)
+```
 
 ## How it works
 
-ClipSync polls the clipboard on both machines every 500ms and hashes the content to detect changes. When a change is detected it serialises the payload — text as UTF-8, images as PNG bytes, files as raw bytes — into a length-prefixed JSON frame and sends it over a plain TCP socket on port 9999.
+**Wire format** (unchanged from V2):
+```
+[4-byte big-endian length][JSON UTF-8]
+text:  { "type": "text",  "text": "..." }
+image: { "type": "image", "data": "<base64 PNG>", "size": N }
+file:  { "type": "file",  "name": "x.png", "data": "<base64>", "size": N }
+```
 
-The Mac runs the server (always listening). Windows runs the client (auto-reconnects if the connection drops). Echo loops are prevented by tracking the hash of the last sent or received payload, and received files are never re-synced because the ClipSync folder itself is filtered out of outgoing file copies.
+**Relay**: server accepts N clients, assigns each an id, and on every incoming frame rebroadcasts the raw bytes to all *other* connected clients. No JSON parsing on the relay path — frames are passed through unmodified.
 
----
+**Echo prevention**: each client tracks `last_hash` of its own clipboard. Before writing an incoming frame to the clipboard, it sets `last_hash` to the new content's hash so the next poll won't re-emit. Saved files (>10MB images, file payloads) hash the destination *path* instead of the bytes, so the file ref placed on the clipboard doesn't loop. Belt-and-braces: the relay also never sends a frame back to the client that sent it.
+
+**Size policy** (same as V2):
+
+| Type            | Behaviour                                              |
+|-----------------|--------------------------------------------------------|
+| Text            | always synced                                          |
+| Image <10 MB    | clipboard image directly                               |
+| Image 10–50 MB  | saved to `~/Downloads/ClipSync/`, path on clipboard    |
+| Image >50 MB    | dropped with warning                                   |
+| File <50 MB     | bytes transferred, native paste (Cmd+V / Ctrl+V) works |
+| File >50 MB     | dropped with warning                                   |
+
+Android client is text-only outbound (Termux:API doesn't expose system-clipboard images or file refs). Inbound images and files still land in `~/storage/downloads/ClipSync/` and the path is pushed to the clipboard as text.
+
+## iPhone
+
+No native ClipSync on iOS. Apple sandbox blocks any background clipboard write from a non-Apple app, so this is unfixable without an iOS app. Bridge via Mac + Handoff like in V2: the Mac is a V3 client and the iPhone shares its clipboard with the Mac through Apple's Universal Clipboard.
+
+If you need iPhone → others without a Mac in the room, the only practical option is a manual iOS Shortcut that POSTs to the relay over Tailscale on share-sheet trigger. Out of scope for now.
+
+## Security
+
+V3 has no app-layer encryption or authentication. It relies on Tailscale (Wireguard + ACLs) for both. **Do not expose port 9999 to the public internet.** If you must run V3 over plain LAN with untrusted devices on the same network, add TLS + HMAC on top — the framing was kept compatible with V2 specifically so this can land without breaking the wire format.
 
 ## Troubleshooting
 
-**Tray icon not visible (Windows)**
-It's probably in the overflow area. Click the `^` arrow near the clock, find the ClipSync icon, and drag it onto the taskbar to pin it permanently. Or go to Settings → Personalization → Taskbar → Other system tray icons.
-
-**Tray icon not visible (Mac)**
-Check System Settings → Privacy & Security → Accessibility and make sure Terminal (or your Python app) is listed.
-
-**No notifications (Mac)**
-Either install `terminal-notifier` (`brew install terminal-notifier`) or grant notification permission to Terminal in System Settings → Notifications.
-
-**No notifications (Windows)**
-Install `plyer` (`pip install plyer`) for the most reliable toast notifications.
-
-**Auto-start not working (Windows)**
-Make sure you ran `--install` as your **normal user, not as Administrator**. Admin elevation causes the task to run in a non-interactive session with no tray or clipboard access. If in doubt, run `clipsync_debug.py` — it will tell you exactly what's wrong.
-
-**Mac IP changed**
-Update it on Windows:
-```powershell
-python clipsync_tray_win.py --host <NEW_IP>
+```bash
+python3 clipsync_debug.py    # Mac
+python clipsync_debug.py     # Windows
 ```
-This saves the new IP automatically. To avoid this happening again, set a DHCP reservation for your Mac in your router settings.
 
-**Mac is asleep**
-When the Mac is asleep, sync is paused — including the iPhone side, since Universal Clipboard requires an awake Mac. Wake-on-LAN support is being considered for V3.
-
-**Run the diagnostics tool**
-If something isn't working on Windows and you're not sure why:
-```powershell
-python clipsync_debug.py
+For Android:
+```sh
+tail -f ~/.clipsync-server-boot.log
+tail -f ~/.clipsync-client-boot.log
 ```
-It checks privileges, dependencies, config, Task Scheduler registration, and recent logs in one pass.
 
----
+## Roadmap
 
-## Requirements
-
-### Mac
-- macOS 12 or later
-- Python 3.10+
-- `pystray`, `Pillow`, `pyobjc-framework-Cocoa`
-- Optionally: `terminal-notifier` (via Homebrew)
-
-### Windows
-- Windows 10 or later
-- Python 3.10+
-- `pystray`, `Pillow`, `pyperclip`, `pywin32`
-- Optionally: `plyer` or BurntToast PowerShell module (for notifications)
-
----
-
-## Security note
-
-V2 runs over plain TCP with no encryption or authentication. This is intentional for a home LAN — the attack surface is limited to devices already on your network. V3 will add TLS and a shared-secret HMAC handshake, making it safe to use over Tailscale across networks.
-
-Do not expose port 9999 to the internet in the meantime.
+| Version | Status      | What                                                                 |
+|---------|-------------|----------------------------------------------------------------------|
+| V1      | ✅ Frozen   | Text only, LAN                                                       |
+| V2      | ✅ Frozen   | Images, files, tray, auto-start                                      |
+| V3      | 🚧 Active   | Multi-client mesh, Android relay, Tailscale                          |
+| Future  | 💭 Maybe    | Optional TLS+HMAC for non-Tailscale users; iOS Shortcut recipe; Wake-on-LAN for sleeping clients |

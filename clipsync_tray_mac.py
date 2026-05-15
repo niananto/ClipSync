@@ -1,142 +1,160 @@
 """
-clipsync_tray_mac.py — Menu bar tray app for ClipSync (Mac)
-Wraps clipboard_server_v2 so you never need to touch a terminal.
+clipsync_tray_mac.py — Menu bar tray for ClipSync V3 (Mac client).
+
+Wraps clipsync_client.ClipSyncClient with a pystray menu bar icon.
+Mac is now a *client* — it dials the Android relay server. Pair with
+Universal Clipboard / Handoff to bridge iPhone via the Mac.
 
 Usage:
-    python3 clipsync_tray_mac.py
+    python3 clipsync_tray_mac.py --host <server>          # first run
+    python3 clipsync_tray_mac.py                          # subsequent (uses ~/.clipsync.conf)
+    python3 clipsync_tray_mac.py --host <server> --install
+    python3 clipsync_tray_mac.py --uninstall
 
-    On first run, follow the prompt to set your config (port, etc.).
-    On subsequent runs, config is loaded from ~/.clipsync.conf
+--host accepts an IP, a LAN hostname, or a Tailscale MagicDNS name
+(e.g. phone.tail-xxxx.ts.net).
+
+V2 collision: --install detects V2's launchd agent and refuses with
+exact uninstall instructions rather than silently replacing it.
 
 Requirements:
     pip3 install pystray Pillow pyobjc-framework-Cocoa
 
-    This file must live in the same directory as clipboard_server_v2.py
-
-Auto-start on login:
-    Run this once to install the launchd agent:
-        python3 clipsync_tray_mac.py --install
-    To uninstall:
-        python3 clipsync_tray_mac.py --uninstall
-
-Menu items:
-    ● ClipSync — Active      (status indicator, not clickable)
-    ─────────────────────
-    Pause Sync               (pauses clipboard watching; connection stays alive)
-    Resume Sync              (only shown when paused)
-    ─────────────────────
-    Open ClipSync Folder     (opens ~/Downloads/ClipSync in Finder)
-    ─────────────────────
-    Quit                     (stops sync and exits)
-
-V3 TODO: Add "Connected / Disconnected" status based on whether a client is connected
-V3 TODO: Load secret from ~/.clipsync.conf for HMAC handshake
+This file must live in the same directory as clipsync_client.py and
+clipboard_mac.py.
 """
 
 import argparse
-import sys
-import os
-import threading
-import time
+import json
 import logging
 import subprocess
+import sys
+import threading
 from pathlib import Path
-from io import BytesIO
 
-# ── Tray icon drawing ──────────────────────────────────────────────────────────
-# We draw the icon in code so there's no asset file to manage.
-# Active = solid clipboard icon; Paused = same but greyed out.
+from PIL import Image, ImageDraw
 
-from PIL import Image, ImageDraw, ImageFont
-
-def _draw_icon(paused: bool = False) -> Image.Image:
-    """
-    Draw a simple clipboard icon.
-    Active: white icon on dark teal background.
-    Paused: white icon on grey background.
-    """
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    bg_color  = (100, 100, 100, 220) if paused else (30, 140, 120, 220)
-    icon_color = (255, 255, 255, 200)
-
-    # Background rounded rect (approximated with ellipse corners)
-    draw.rounded_rectangle([2, 2, size - 2, size - 2], radius=10, fill=bg_color)
-
-    # Clipboard body
-    draw.rounded_rectangle([14, 20, 50, 56], radius=4, fill=None, outline=icon_color, width=3)
-
-    # Clip at top
-    draw.rounded_rectangle([22, 14, 42, 24], radius=4, fill=bg_color, outline=icon_color, width=3)
-
-    # Lines on clipboard
-    draw.line([20, 32, 44, 32], fill=icon_color, width=2)
-    draw.line([20, 38, 44, 38], fill=icon_color, width=2)
-    draw.line([20, 44, 36, 44], fill=icon_color, width=2)
-
-    # Paused indicator: small "||" overlay in bottom-right
-    if paused:
-        draw.rectangle([38, 42, 42, 54], fill=(255, 200, 0, 230))
-        draw.rectangle([44, 42, 48, 54], fill=(255, 200, 0, 230))
-
-    return img
-
-
-# ── Config ─────────────────────────────────────────────────────────────────────
-CONFIG_PATH   = Path.home() / ".clipsync.conf"
-CLIPSYNC_DIR  = Path.home() / "Downloads" / "ClipSync"
-PLIST_DIR     = Path.home() / "Library" / "LaunchAgents"
-PLIST_NAME    = "com.clipsync.server.plist"
-LOG_DIR       = Path.home() / "Library" / "Logs" / "ClipSync"
+# ── Config paths ───────────────────────────────────────────────────────────────
+CONFIG_PATH    = Path.home() / ".clipsync.conf"
+PLIST_DIR      = Path.home() / "Library" / "LaunchAgents"
+V3_PLIST_NAME  = "com.clipsync.v3.client.plist"
+V3_PLIST_LABEL = "com.clipsync.v3.client"
+V2_PLIST_NAME  = "com.clipsync.server.plist"
+V2_PLIST_LABEL = "com.clipsync.server"
+LOG_DIR        = Path.home() / "Library" / "Logs" / "ClipSync"
+DEFAULT_PORT   = 9999
 # ───────────────────────────────────────────────────────────────────────────────
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[logging.FileHandler(LOG_DIR / "clipsync_v3.log", encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("clipsync.tray")
+log = logging.getLogger("clipsync.tray.mac")
+
+# Make sibling modules importable when launchd runs us from /
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import clipboard_mac as cb
+from clipsync_client import ClipSyncClient
+
+
+# ── Icon ───────────────────────────────────────────────────────────────────────
+
+def _draw_icon(paused: bool = False) -> Image.Image:
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    bg = (100, 100, 100, 220) if paused else (30, 140, 120, 220)
+    fg = (255, 255, 255, 220)
+    draw.rounded_rectangle([2, 2, size - 2, size - 2], radius=10, fill=bg)
+    draw.rounded_rectangle([14, 20, 50, 56], radius=4, outline=fg, width=3)
+    draw.rounded_rectangle([22, 14, 42, 24], radius=4, fill=bg, outline=fg, width=3)
+    draw.line([20, 32, 44, 32], fill=fg, width=2)
+    draw.line([20, 38, 44, 38], fill=fg, width=2)
+    draw.line([20, 44, 36, 44], fill=fg, width=2)
+    if paused:
+        draw.rectangle([38, 42, 42, 54], fill=(255, 200, 0, 230))
+        draw.rectangle([44, 42, 48, 54], fill=(255, 200, 0, 230))
+    return img
+
+
+# ── Config file ────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+# ── V2 collision detection ─────────────────────────────────────────────────────
+
+def detect_v2() -> bool:
+    """True if V2's launchd agent is installed."""
+    v2_plist = PLIST_DIR / V2_PLIST_NAME
+    if v2_plist.exists():
+        return True
+    try:
+        result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
+        return V2_PLIST_LABEL in result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def print_v2_uninstall_instructions() -> None:
+    v2_plist = PLIST_DIR / V2_PLIST_NAME
+    print("ERROR: ClipSync V2 is already installed as a login agent.")
+    print("V3 won't install on top of it — uninstall V2 first, then rerun --install.")
+    print()
+    print("Run these commands:")
+    print(f"  launchctl unload {v2_plist}")
+    print(f"  rm {v2_plist}")
+    print()
+    print("Or if you still have V2's tray script around:")
+    print("  python3 v2/clipsync_tray_mac.py --uninstall")
 
 
 # ── launchd install / uninstall ────────────────────────────────────────────────
 
-def _get_plist_content() -> str:
+def _plist_xml(host: str, port: int) -> str:
     python  = sys.executable
     script  = str(Path(__file__).resolve())
-    log_out = str(LOG_DIR / "clipsync.log")
-    log_err = str(LOG_DIR / "clipsync_err.log")
-
+    log_out = str(LOG_DIR / "clipsync_v3.log")
+    log_err = str(LOG_DIR / "clipsync_v3.err.log")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.clipsync.server</string>
-
+    <string>{V3_PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{python}</string>
         <string>{script}</string>
+        <string>--host</string>
+        <string>{host}</string>
+        <string>--port</string>
+        <string>{port}</string>
     </array>
-
-    <!-- Start automatically when you log in -->
     <key>RunAtLoad</key>
     <true/>
-
-    <!-- Restart if it crashes -->
     <key>KeepAlive</key>
     <true/>
-
-    <!-- Log output -->
     <key>StandardOutPath</key>
     <string>{log_out}</string>
     <key>StandardErrorPath</key>
     <string>{log_err}</string>
-
-    <!-- Give it your home environment -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -147,279 +165,133 @@ def _get_plist_content() -> str:
 """
 
 
-def cmd_install():
-    """Install the launchd agent so ClipSync starts on login."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+def cmd_install(host: str, port: int) -> None:
+    if detect_v2():
+        print_v2_uninstall_instructions()
+        sys.exit(2)
+
     PLIST_DIR.mkdir(parents=True, exist_ok=True)
-    plist_path = PLIST_DIR / PLIST_NAME
+    plist_path = PLIST_DIR / V3_PLIST_NAME
 
-    plist_path.write_text(_get_plist_content())
+    save_config({"host": host, "port": port})
+    plist_path.write_text(_plist_xml(host, port))
     subprocess.run(["launchctl", "load", "-w", str(plist_path)], check=False)
-    print(f"✅ ClipSync installed as login agent.")
+    print(f"✅ ClipSync V3 installed as login agent.")
     print(f"   Plist:  {plist_path}")
-    print(f"   Logs:   {LOG_DIR}/clipsync.log")
-    print(f"   To stop without uninstalling: launchctl stop com.clipsync.server")
-    print(f"   To uninstall: python3 {__file__} --uninstall")
+    print(f"   Config: {CONFIG_PATH}")
+    print(f"   Logs:   {LOG_DIR / 'clipsync_v3.log'}")
+    print(f"   Stop:   launchctl stop {V3_PLIST_LABEL}")
+    print(f"   Uninstall: python3 {__file__} --uninstall")
 
 
-def cmd_uninstall():
-    """Remove the launchd agent."""
-    plist_path = PLIST_DIR / PLIST_NAME
+def cmd_uninstall() -> None:
+    plist_path = PLIST_DIR / V3_PLIST_NAME
     if plist_path.exists():
         subprocess.run(["launchctl", "unload", "-w", str(plist_path)], check=False)
         plist_path.unlink()
-        print("✅ ClipSync login agent removed.")
+        print("✅ ClipSync V3 login agent removed.")
     else:
-        print("ℹ️  No launchd agent found — nothing to remove.")
+        print("ℹ️  No V3 launchd agent found.")
 
 
-# ── Sync engine (thin wrapper around clipboard_server_v2) ──────────────────────
+# ── Tray runtime ───────────────────────────────────────────────────────────────
 
-# Add script directory to path so we can import the server module
-sys.path.insert(0, str(Path(__file__).parent))
-
-try:
-    import clipboard_server_v2 as _server
-    SERVER_AVAILABLE = True
-except ImportError as e:
-    SERVER_AVAILABLE = False
-    log.error(f"Could not import clipboard_server_v2: {e}")
-    log.error("Make sure clipsync_tray_mac.py and clipboard_server_v2.py are in the same folder.")
-
-
-class SyncEngine:
-    """
-    Owns the shared_state and all sync threads.
-    The tray calls pause() / resume() / stop() on this.
-    """
-
-    def __init__(self):
-        self._paused   = False
-        self._stopped  = False
-        self._lock     = threading.Lock()
-        self.shared_state: dict = {}
-
-    @property
-    def paused(self) -> bool:
-        return self._paused
-
-    @property
-    def stopped(self) -> bool:
-        return self._stopped
-
-    def pause(self):
-        with self._lock:
-            self._paused = True
-            self.shared_state["paused"] = True
-        log.info("Sync paused")
-
-    def resume(self):
-        with self._lock:
-            self._paused = False
-            self.shared_state["paused"] = False
-        log.info("Sync resumed")
-
-    def stop(self):
-        with self._lock:
-            self._stopped = True
-            self.shared_state["stopped"] = True
-        log.info("Sync stopping")
-
-    def start(self):
-        """Start server socket + clipboard watcher in background threads."""
-        if not SERVER_AVAILABLE:
-            log.error("Server module not available — sync will not run")
-            return
-
-        initial = _server.read_clipboard()
-        self.shared_state = {
-            "last_hash": _server.hash_payload(initial) if initial else "",
-            "conn":      None,
-            "paused":    False,
-            "stopped":   False,
-        }
-
-        # Clipboard watcher — patched to respect paused/stopped flags
-        def watcher_loop():
-            log.info("Clipboard watcher started")
-            while not self.shared_state.get("stopped"):
-                time.sleep(_server.POLL_INTERVAL)
-                if self.shared_state.get("paused"):
-                    continue
-
-                payload = _server.read_clipboard()
-                if payload is None:
-                    continue
-
-                current_hash = _server.hash_payload(payload)
-                if current_hash == self.shared_state.get("last_hash"):
-                    continue
-
-                self.shared_state["last_hash"] = current_hash
-                conn = self.shared_state.get("conn")
-                if not conn:
-                    continue
-
-                t = payload["type"]
-                if t == "text":
-                    log.info(f"→ Text to Windows ({len(payload['text'])} chars)")
-                elif t == "image":
-                    size = len(payload["png_bytes"])
-                    if size > _server.IMAGE_FILE_MAX:
-                        log.warning(f"Image too large ({size / 1e6:.1f}MB) — skipping")
-                        continue
-                    log.info(f"→ Image to Windows ({size / 1e6:.1f}MB)")
-                elif t == "file":
-                    log.info(f"→ File to Windows: {payload['name']}")
-
-                ok = _server.send_payload(conn, payload)
-                if not ok:
-                    log.warning("Send failed — client may have disconnected")
-
-        # Socket server — accepts one client at a time
-        def server_loop():
-            import socket
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((_server.HOST, _server.PORT))
-            srv.listen(1)
-            srv.settimeout(1.0)  # So we can check stopped flag periodically
-            log.info(f"ClipSync listening on port {_server.PORT}")
-            log.info(f"ClipSync folder: {_server.CLIPSYNC_DIR}")
-
-            while not self.shared_state.get("stopped"):
-                try:
-                    conn, addr = srv.accept()
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-
-                # Wrap handle_client to also check paused flag on incoming messages
-                def handle(conn=conn, addr=addr):
-                    log.info(f"Windows connected: {addr}")
-                    self.shared_state["conn"] = conn
-                    try:
-                        while not self.shared_state.get("stopped"):
-                            payload = _server.decode_message(conn)
-                            if payload is None:
-                                log.info(f"Client disconnected: {addr}")
-                                break
-                            if self.shared_state.get("paused"):
-                                continue  # Drop incoming while paused
-                            new_hash = _server.apply_incoming(payload, self.shared_state)
-                            self.shared_state["last_hash"] = new_hash
-                    finally:
-                        self.shared_state["conn"] = None
-                        conn.close()
-
-                threading.Thread(target=handle, daemon=True).start()
-
-            srv.close()
-
-        threading.Thread(target=watcher_loop, daemon=True).start()
-        threading.Thread(target=server_loop,  daemon=True).start()
-
-
-# ── Tray icon ──────────────────────────────────────────────────────────────────
-
-def run_tray(engine: SyncEngine):
+def run_tray(client: ClipSyncClient) -> None:
     try:
         import pystray
     except ImportError:
         log.error("pystray not installed. Run: pip3 install pystray")
-        # Fall back to running headless (no tray, Ctrl+C to quit)
-        log.info("Running headless — press Ctrl+C to quit")
+        log.info("Running headless — Ctrl+C to quit")
         try:
-            while not engine.stopped:
-                time.sleep(1)
+            client.wait()
         except KeyboardInterrupt:
-            engine.stop()
+            client.shutdown()
         return
 
-    icon_ref: list = [None]  # mutable container so callbacks can reference icon
+    icon_ref: list = [None]
 
-    def update_icon():
+    def refresh():
         if icon_ref[0]:
-            icon_ref[0].icon  = _draw_icon(paused=engine.paused)
-            icon_ref[0].title = "ClipSync — Paused" if engine.paused else "ClipSync — Active"
+            icon_ref[0].icon  = _draw_icon(paused=client.paused.is_set())
+            icon_ref[0].title = "ClipSync V3 — Paused" if client.paused.is_set() else "ClipSync V3 — Active"
             icon_ref[0].update_menu()
 
-    def on_pause_resume(icon, item):
-        if engine.paused:
-            engine.resume()
+    def on_pause(icon, item):
+        if client.paused.is_set():
+            client.paused.clear()
+            log.info("resumed")
         else:
-            engine.pause()
-        update_icon()
+            client.paused.set()
+            log.info("paused")
+        refresh()
 
-    def on_open_folder(icon, item):
-        CLIPSYNC_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["open", str(CLIPSYNC_DIR)])
+    def on_open(icon, item):
+        cb.CLIPSYNC_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(cb.CLIPSYNC_DIR)])
 
     def on_quit(icon, item):
-        engine.stop()
+        client.shutdown()
         icon.stop()
 
     def make_menu():
-        status_text = "⏸ Paused" if engine.paused else "● Active"
-        toggle_text = "Resume Sync" if engine.paused else "Pause Sync"
+        status = "⏸ Paused" if client.paused.is_set() else "● Active"
+        toggle = "Resume Sync" if client.paused.is_set() else "Pause Sync"
         return pystray.Menu(
-            pystray.MenuItem(f"ClipSync — {status_text}", None, enabled=False),
+            pystray.MenuItem(f"ClipSync V3 — {status}", None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(toggle_text, on_pause_resume),
+            pystray.MenuItem(toggle, on_pause),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open ClipSync Folder", on_open_folder),
+            pystray.MenuItem("Open ClipSync Folder", on_open),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         )
 
     icon = pystray.Icon(
-        name="ClipSync",
+        name="ClipSync V3",
         icon=_draw_icon(paused=False),
-        title="ClipSync — Active",
-        menu=pystray.Menu(
-            pystray.MenuItem("ClipSync — ● Active", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Pause Sync",           on_pause_resume),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open ClipSync Folder", on_open_folder),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",                 on_quit),
-        ),
+        title="ClipSync V3 — Active",
+        menu=pystray.Menu(lambda: make_menu().items),
     )
     icon_ref[0] = icon
-
-    # Rebuild menu dynamically so Pause↔Resume label flips correctly
-    icon.menu = pystray.Menu(lambda: make_menu().items)
-
-    log.info("Tray icon started — look for the clipboard icon in your menu bar")
-    icon.run()  # Blocks until icon.stop() is called
+    log.info("tray started — look for the clipboard icon in the menu bar")
+    icon.run()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="ClipSync Tray — Mac")
-    parser.add_argument("--install",   action="store_true", help="Install as login agent and exit")
-    parser.add_argument("--uninstall", action="store_true", help="Remove login agent and exit")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ClipSync V3 tray (Mac client)")
+    parser.add_argument("--host", help="server address (IP, hostname, or Tailscale MagicDNS name)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--install",   action="store_true", help="install login agent and exit")
+    parser.add_argument("--uninstall", action="store_true", help="remove login agent and exit")
     args = parser.parse_args()
 
-    if args.install:
-        cmd_install()
-        return
     if args.uninstall:
         cmd_uninstall()
         return
 
-    if not SERVER_AVAILABLE:
-        sys.exit(
-            "ERROR: clipboard_server_v2.py not found in the same directory.\n"
-            "Place both files in the same folder and try again."
-        )
+    cfg = load_config()
+    host = args.host or cfg.get("host")
+    port = args.port if args.port != DEFAULT_PORT else cfg.get("port", DEFAULT_PORT)
 
-    engine = SyncEngine()
-    engine.start()
-    run_tray(engine)
+    if args.install:
+        if not host:
+            sys.exit("--install requires --host on first run")
+        cmd_install(host, port)
+        return
+
+    if not host:
+        sys.exit("No --host given and ~/.clipsync.conf missing. Run with --host <server>.")
+
+    # Persist host so future runs (and launchd) don't need flags
+    save_config({"host": host, "port": port})
+
+    paused = threading.Event()
+    stop   = threading.Event()
+    client = ClipSyncClient(host, port, cb, paused=paused, stop=stop)
+    client.start()
+    run_tray(client)
 
 
 if __name__ == "__main__":

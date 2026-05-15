@@ -1,146 +1,236 @@
 """
-clipsync_debug.py — Run this to diagnose why ClipSync tray isn't showing.
-Place in the same folder as clipsync_tray_win.py and run as your normal user.
+clipsync_debug.py — V3 diagnostic.
 
-    python clipsync_debug.py
+Run on Mac or Windows when ClipSync V3 isn't behaving. Cross-platform:
+detects what OS it's on and runs only the relevant checks.
 
-It will check every possible failure point and tell you exactly what's wrong.
+    python3 clipsync_debug.py            # Mac
+    python clipsync_debug.py             # Windows
+
+Checks:
+    1. Python version + executable
+    2. Required packages for this platform
+    3. Config file present + parseable
+    4. V2 collision: is the old V2 launchd agent / scheduled task still
+       registered? If yes, V2 and V3 may both be running and racing on
+       the clipboard.
+    5. V3 install state: is the V3 launchd agent / scheduled task
+       registered, and is it currently running?
+    6. Server reachability: TCP-connect to the configured host:port.
 """
 
-import sys
+from __future__ import annotations
+
+import json
 import os
+import socket
 import subprocess
-import winreg
+import sys
 from pathlib import Path
 
-APPDATA    = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-CONFIG_DIR = APPDATA / "ClipSync"
-CONFIG_FILE = CONFIG_DIR / "clipsync.conf"
-LOG_FILE   = CONFIG_DIR / "clipsync.log"
+OK    = "[OK]   "
+WARN  = "[WARN] "
+FAIL  = "[FAIL] "
+INFO  = "[INFO] "
 
-print("=" * 60)
-print("ClipSync Diagnostics")
-print("=" * 60)
 
-# ── 1. Are we running as admin? ───────────────────────────────
-print("\n[1] Privilege check")
-try:
-    import ctypes
-    is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    if is_admin:
-        print("  ❌ Running as ADMINISTRATOR — this will break the tray icon.")
-        print("     Close this window and re-run as your normal user (no 'Run as admin').")
-    else:
-        print("  ✅ Running as normal user (correct)")
-except Exception as e:
-    print(f"  ⚠️  Could not check admin status: {e}")
+def section(title: str) -> None:
+    print()
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
 
-# ── 2. Python executable ──────────────────────────────────────
-print("\n[2] Python")
-print(f"  Executable: {sys.executable}")
-print(f"  Version:    {sys.version}")
 
-# ── 3. Required packages ──────────────────────────────────────
-print("\n[3] Required packages")
-packages = ["pystray", "PIL", "pyperclip", "win32clipboard"]
-for pkg in packages:
+def check_python() -> None:
+    section("1. Python")
+    print(f"{INFO}executable: {sys.executable}")
+    print(f"{INFO}version:    {sys.version.split()[0]}")
+    if sys.version_info < (3, 10):
+        print(f"{FAIL}need Python 3.10+")
+
+
+def check_packages_mac() -> None:
+    section("2. Required packages (Mac)")
+    for name, mod in [("pystray", "pystray"), ("Pillow", "PIL"),
+                      ("pyobjc-framework-Cocoa", "AppKit")]:
+        try:
+            __import__(mod)
+            print(f"{OK}{name}")
+        except ImportError:
+            print(f"{FAIL}{name} missing — pip3 install {name}")
+
+
+def check_packages_win() -> None:
+    section("2. Required packages (Windows)")
+    for name, mod in [("pystray", "pystray"), ("Pillow", "PIL"),
+                      ("pyperclip", "pyperclip"), ("pywin32", "win32clipboard")]:
+        try:
+            __import__(mod)
+            print(f"{OK}{name}")
+        except ImportError:
+            print(f"{FAIL}{name} missing — pip install {name}")
+
+
+def check_admin_win() -> None:
+    section("2b. Privilege check (Windows)")
     try:
-        __import__(pkg)
-        print(f"  ✅ {pkg}")
-    except ImportError:
-        pip_name = {"PIL": "Pillow", "win32clipboard": "pywin32"}.get(pkg, pkg)
-        print(f"  ❌ {pkg} — install with: pip install {pip_name}")
+        import ctypes
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        if is_admin:
+            print(f"{FAIL}running as ADMINISTRATOR — tray + clipboard will fail.")
+            print("       close and re-run as your normal user.")
+        else:
+            print(f"{OK}running as normal user")
+    except OSError as e:
+        print(f"{WARN}could not check admin status: {e}")
 
-# ── 4. ClipSync files present ────────────────────────────────
-print("\n[4] ClipSync files")
-here = Path(__file__).parent
-for fname in ["clipboard_client_v2.py", "clipsync_tray_win.py"]:
-    p = here / fname
-    print(f"  {'✅' if p.exists() else '❌'} {fname} {'(found)' if p.exists() else '(MISSING)'}")
 
-# ── 5. Config file ────────────────────────────────────────────
-print("\n[5] Config file")
-if CONFIG_FILE.exists():
-    content = CONFIG_FILE.read_text()
-    print(f"  ✅ Found at {CONFIG_FILE}")
-    print(f"     Contents: {content.strip()}")
-    if "host=" not in content:
-        print("  ❌ No 'host' key found in config — run with --host 192.168.10.145")
-else:
-    print(f"  ❌ Not found at {CONFIG_FILE}")
-    print(f"     Run: python clipsync_tray_win.py --host 192.168.10.145")
+def load_config_mac() -> dict:
+    p = Path.home() / ".clipsync.conf"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
-# ── 6. Task Scheduler task ────────────────────────────────────
-print("\n[6] Task Scheduler task")
-result = subprocess.run(
-    ["schtasks", "/query", "/tn", "ClipSync", "/fo", "LIST", "/v"],
-    capture_output=True, text=True,
-)
-if result.returncode == 0:
-    lines = {
-        line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
-        for line in result.stdout.splitlines()
-        if ":" in line
-    }
-    print(f"  ✅ Task exists")
-    run_as = lines.get("Run As User", "unknown")
-    logon  = lines.get("Logon Mode",  "unknown")
-    status = lines.get("Status",      "unknown")
-    print(f"     Run As User: {run_as}")
-    print(f"     Logon Mode:  {logon}")
-    print(f"     Status:      {status}")
-    if "interactive" not in logon.lower():
-        print("  ❌ Logon Mode is NOT interactive — tray will NOT appear.")
-        print("     Fix: python clipsync_tray_win.py --uninstall")
-        print("          python clipsync_tray_win.py --install  (as normal user, no admin)")
+
+def load_config_win() -> dict:
+    p = Path(os.environ.get("APPDATA", "")) / "ClipSync" / "clipsync.conf"
+    if not p.exists():
+        return {}
+    try:
+        text = p.read_text(encoding="utf-8").strip()
+        if text.startswith("{"):
+            return json.loads(text)
+        cfg: dict = {}
+        for line in text.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip()
+        return cfg
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def check_config(cfg: dict) -> dict:
+    section("3. Config")
+    if not cfg:
+        print(f"{WARN}no config file — first run needs --host")
+        return cfg
+    print(f"{OK}host: {cfg.get('host', '(unset)')}")
+    print(f"{OK}port: {cfg.get('port', 9999)}")
+    return cfg
+
+
+def check_collision_mac() -> None:
+    section("4. V2 collision (Mac)")
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.clipsync.server.plist"
+    bad = plist.exists()
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
+        bad = bad or ("com.clipsync.server" in out and "com.clipsync.v3" not in out.split("com.clipsync.server")[1][:50])
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if bad:
+        print(f"{FAIL}V2 login agent still installed.")
+        print(f"       launchctl unload {plist}")
+        print(f"       rm {plist}")
     else:
-        print("  ✅ Logon mode is interactive (correct)")
-    if "SYSTEM" in run_as.upper() or "Administrator" in run_as:
-        print(f"  ❌ Task is registered under '{run_as}' — must be your own user account.")
-else:
-    print("  ℹ️  No ClipSync task found (not installed yet)")
+        print(f"{OK}no V2 agent registered")
 
-# ── 7. Log file ───────────────────────────────────────────────
-print("\n[7] Log file")
-if LOG_FILE.exists():
-    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    last  = lines[-20:] if len(lines) > 20 else lines
-    print(f"  ✅ Found at {LOG_FILE}")
-    print(f"  Last {len(last)} lines:")
-    for line in last:
-        print(f"    {line}")
-else:
-    print(f"  ℹ️  No log file yet at {LOG_FILE}")
-    print(f"     The task hasn't run successfully yet, or it crashed before logging.")
 
-# ── 8. Try importing tray script directly ────────────────────
-print("\n[8] Import test")
-try:
-    sys.path.insert(0, str(here))
-    import clipsync_tray_win
-    print("  ✅ clipsync_tray_win.py imports without errors")
-except Exception as e:
-    print(f"  ❌ Import failed: {e}")
+def check_v3_state_mac() -> None:
+    section("5. V3 install state (Mac)")
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.clipsync.v3.client.plist"
+    if not plist.exists():
+        print(f"{INFO}V3 not installed as login agent (manual-run mode)")
+        return
+    print(f"{OK}V3 plist: {plist}")
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
+        if "com.clipsync.v3.client" in out:
+            print(f"{OK}V3 agent currently loaded")
+        else:
+            print(f"{WARN}V3 plist exists but not loaded — try: launchctl load -w {plist}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"{WARN}launchctl list failed: {e}")
 
-# ── 9. pystray smoke test ─────────────────────────────────────
-print("\n[9] pystray smoke test")
-try:
-    import pystray
-    from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (64, 64), (30, 140, 120, 220))
-    icon = pystray.Icon("test", img, "ClipSync Test")
-    print("  ✅ pystray icon object created successfully")
-    print("  ℹ️  To fully test the tray, run: python clipsync_tray_win.py")
-    print("     (the smoke test can't display the icon without blocking)")
-except Exception as e:
-    print(f"  ❌ pystray failed: {e}")
 
-# ── Summary ───────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("Next steps:")
-print("  1. Fix any ❌ items above")
-print("  2. Run manually first to confirm tray works:")
-print("     python clipsync_tray_win.py")
-print("  3. If manual works but auto-start doesn't, the Task Scheduler")
-print("     logon mode is wrong — uninstall and reinstall as normal user.")
-print("=" * 60)
+def check_collision_win() -> None:
+    section("4. V2 collision (Windows)")
+    try:
+        result = subprocess.run(["schtasks", "/query", "/tn", "ClipSync"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print(f"{FAIL}V2 task 'ClipSync' still registered.")
+            print(f"       schtasks /end /tn ClipSync")
+            print(f"       schtasks /delete /tn ClipSync /f")
+        else:
+            print(f"{OK}no V2 task registered")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"{WARN}schtasks check failed: {e}")
+
+
+def check_v3_state_win() -> None:
+    section("5. V3 install state (Windows)")
+    try:
+        result = subprocess.run(["schtasks", "/query", "/tn", "ClipSyncV3", "/v", "/fo", "LIST"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            print(f"{INFO}V3 task not registered (manual-run mode)")
+            return
+        print(f"{OK}V3 task 'ClipSyncV3' registered")
+        for line in result.stdout.splitlines():
+            if "Status:" in line or "Last Run" in line or "Last Result" in line:
+                print(f"       {line.strip()}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"{WARN}schtasks check failed: {e}")
+
+
+def check_reachability(cfg: dict) -> None:
+    section("6. Server reachability")
+    host = cfg.get("host")
+    port = int(cfg.get("port", 9999))
+    if not host:
+        print(f"{WARN}no host configured, skipping")
+        return
+    print(f"{INFO}trying TCP connect to {host}:{port} (timeout 5s)")
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            print(f"{OK}connected — server is reachable")
+    except OSError as e:
+        print(f"{FAIL}cannot reach {host}:{port}: {e}")
+        print("       check: phone awake, Tailscale up, server running, ACLs")
+
+
+def main() -> None:
+    print("=" * 60)
+    print("ClipSync V3 diagnostics")
+    print("=" * 60)
+    print(f"{INFO}platform: {sys.platform}")
+
+    check_python()
+
+    if sys.platform == "darwin":
+        check_packages_mac()
+        cfg = check_config(load_config_mac())
+        check_collision_mac()
+        check_v3_state_mac()
+        check_reachability(cfg)
+    elif sys.platform == "win32":
+        check_packages_win()
+        check_admin_win()
+        cfg = check_config(load_config_win())
+        check_collision_win()
+        check_v3_state_win()
+        check_reachability(cfg)
+    else:
+        print(f"{INFO}no platform-specific checks for {sys.platform}")
+        print(f"{INFO}for Android: tail -f ~/.clipsync-server-boot.log ~/.clipsync-client-boot.log")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
